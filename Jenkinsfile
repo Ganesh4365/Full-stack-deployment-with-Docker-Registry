@@ -42,6 +42,7 @@ pipeline {
         CONTAINER_NAME = "${params.CONTAINER_NAME}"
         HOST_PORT = "${params.HOST_PORT}"
         CONTAINER_PORT = "${params.CONTAINER_PORT}"
+        IMAGE_TAG = "v${BUILD_NUMBER}"
     }
 
     stages {
