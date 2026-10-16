@@ -45,7 +45,7 @@ export function Navbar() {
               N
             </div>
             <span className="font-display-md text-lg sm:text-xl md:text-2xl font-extrabold tracking-tight text-slate-900">
-              IronStack <span className="text-indigo-600 font-semibold">Systems</span>
+              IronStack man <span className="text-indigo-600 font-semibold">Systems</span>
             </span>
           </Link>
           
