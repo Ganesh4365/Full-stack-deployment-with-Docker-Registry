@@ -5,6 +5,7 @@ pipeline {
     options {
         timestamps()
         disableConcurrentBuilds()
+        skipDefaultCheckout(true)
     }
 
     parameters {
@@ -35,9 +36,18 @@ pipeline {
         )
     }
 
+    environment {
+        DOCKERHUB_REPO = "${params.DOCKERHUB_REPO}"
+        RELEASE_VERSION = "${params.RELEASE_VERSION}"
+        CONTAINER_NAME = "${params.CONTAINER_NAME}"
+        HOST_PORT = "${params.HOST_PORT}"
+        CONTAINER_PORT = "${params.CONTAINER_PORT}"
+    }
+
     stages {
         stage('Checkout') {
             steps {
+                // Perform one checkout only.
                 checkout scm
 
                 sh '''
@@ -45,6 +55,45 @@ pipeline {
                     echo "Commit: $(git rev-parse --short HEAD)"
                     test -f Dockerfile
                     test -f Jenkinsfile
+                    test -f package.json
+                '''
+            }
+        }
+
+        stage('Validate Parameters') {
+            steps {
+                sh '''
+                    set -eu
+
+                    test -n "$DOCKERHUB_REPO"
+                    test -n "$RELEASE_VERSION"
+                    test -n "$CONTAINER_NAME"
+
+                    case "$HOST_PORT" in
+                        *[!0-9]*|'') echo "Invalid HOST_PORT"; exit 1 ;;
+                    esac
+
+                    case "$CONTAINER_PORT" in
+                        *[!0-9]*|'') echo "Invalid CONTAINER_PORT"; exit 1 ;;
+                    esac
+
+                    [ "$HOST_PORT" -ge 1 ] &&
+                    [ "$HOST_PORT" -le 65535 ] || {
+                        echo "HOST_PORT must be between 1 and 65535"
+                        exit 1
+                    }
+
+                    [ "$CONTAINER_PORT" -ge 1 ] &&
+                    [ "$CONTAINER_PORT" -le 65535 ] || {
+                        echo "CONTAINER_PORT must be between 1 and 65535"
+                        exit 1
+                    }
+
+                    echo "Repository: $DOCKERHUB_REPO"
+                    echo "Version: $RELEASE_VERSION"
+                    echo "Container: $CONTAINER_NAME"
+                    echo "Host port: $HOST_PORT"
+                    echo "Container port: $CONTAINER_PORT"
                 '''
             }
         }
@@ -57,8 +106,8 @@ pipeline {
                     IMAGE="${DOCKERHUB_REPO}:${RELEASE_VERSION}"
 
                     docker build \
-                      --pull \
-                      --tag "$IMAGE" .
+                        --pull \
+                        --tag "$IMAGE" .
                 '''
             }
         }
@@ -67,8 +116,12 @@ pipeline {
             steps {
                 sh '''
                     set -eu
+
                     docker image inspect \
-                      "${DOCKERHUB_REPO}:${RELEASE_VERSION}"
+                        "${DOCKERHUB_REPO}:${RELEASE_VERSION}" \
+                        >/dev/null
+
+                    echo "Image verification succeeded."
                 '''
             }
         }
@@ -87,14 +140,12 @@ pipeline {
                         set +x
 
                         echo "$REGISTRY_TOKEN" |
-                          docker login \
-                            --username "$REGISTRY_USER" \
-                            --password-stdin
+                            docker login \
+                                --username "$REGISTRY_USER" \
+                                --password-stdin
 
                         docker push \
-                          "${DOCKERHUB_REPO}:${RELEASE_VERSION}"
-
-                        docker logout
+                            "${DOCKERHUB_REPO}:${RELEASE_VERSION}"
                     '''
                 }
             }
@@ -102,12 +153,28 @@ pipeline {
 
         stage('Pull Published Image') {
             steps {
-                sh '''
-                    set -eu
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'REGISTRY_USER',
+                        passwordVariable: 'REGISTRY_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
 
-                    docker pull \
-                      "${DOCKERHUB_REPO}:${RELEASE_VERSION}"
-                '''
+                        echo "$REGISTRY_TOKEN" |
+                            docker login \
+                                --username "$REGISTRY_USER" \
+                                --password-stdin
+
+                        docker pull \
+                            "${DOCKERHUB_REPO}:${RELEASE_VERSION}"
+
+                        docker logout
+                    '''
+                }
             }
         }
 
@@ -121,15 +188,16 @@ pipeline {
                     PORT="$HOST_PORT"
                     TARGET_PORT="$CONTAINER_PORT"
 
-                    # Save the old image reference for rollback.
-                    OLD_IMAGE=$(docker inspect \
-                      --format '{{.Config.Image}}' "$NAME" 2>/dev/null || true)
-
-                    # Validate the new image before replacing the old container.
+                    # Confirm the published image exists locally.
                     docker image inspect "$IMAGE" >/dev/null
 
-                    # Remove the previous container only after the new image
-                    # has been built, pushed, and pulled successfully.
+                    # Record the existing container's image for rollback.
+                    OLD_IMAGE=$(docker inspect \
+                        --format '{{.Config.Image}}' "$NAME" \
+                        2>/dev/null || true)
+
+                    # Remove the previous container only after the image
+                    # has built, pushed, and pulled successfully.
                     docker rm -f "$NAME" 2>/dev/null || true
 
                     # Start the new release.
@@ -143,18 +211,21 @@ pipeline {
 
                         if [ -n "$OLD_IMAGE" ]; then
                             docker run -d \
-                              --name "$NAME" \
-                              --restart unless-stopped \
-                              -p "${PORT}:${TARGET_PORT}" \
-                              "$OLD_IMAGE"
+                                --name "$NAME" \
+                                --restart unless-stopped \
+                                -p "${PORT}:${TARGET_PORT}" \
+                                "$OLD_IMAGE"
+                            echo "Previous image restarted."
                         fi
 
                         exit 1
                     fi
 
-                    # Check that the website responds over HTTP.
+                    # Verify the application responds over HTTP.
                     if ! curl --fail --silent --show-error \
-                        --retry 10 --retry-delay 2 --retry-connrefused \
+                        --retry 10 \
+                        --retry-delay 2 \
+                        --retry-connrefused \
                         "http://127.0.0.1:${PORT}/" >/dev/null; then
 
                         echo "HTTP verification failed. Rolling back."
@@ -163,20 +234,21 @@ pipeline {
 
                         if [ -n "$OLD_IMAGE" ]; then
                             docker run -d \
-                              --name "$NAME" \
-                              --restart unless-stopped \
-                              -p "${PORT}:${TARGET_PORT}" \
-                              "$OLD_IMAGE"
+                                --name "$NAME" \
+                                --restart unless-stopped \
+                                -p "${PORT}:${TARGET_PORT}" \
+                                "$OLD_IMAGE"
 
                             echo "Previous image restarted."
                         else
-                            echo "No previous container image was recorded."
+                            echo "No previous image available for rollback."
                         fi
 
                         exit 1
                     fi
 
                     echo "Deployment and HTTP verification succeeded."
+
                     docker ps --filter "name=^/${NAME}$"
                 '''
             }
@@ -185,10 +257,15 @@ pipeline {
 
     post {
         success {
-            echo 'Build, registry push, pull, and deployment succeeded.'
+            echo 'SUCCESS: Image built, verified, pushed, pulled, and deployed.'
         }
+
         failure {
-            echo 'Pipeline failed. Inspect Console Output to identify the failed stage.'
+            echo 'FAILURE: Check Console Output for the first failed stage.'
+        }
+
+        always {
+            echo 'Pipeline execution finished.'
         }
     }
 }
