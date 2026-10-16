@@ -12,36 +12,35 @@ pipeline {
         string(
             name: 'DOCKERHUB_REPO',
             defaultValue: 'ganeshsuryawanshi12345/website',
-            description: 'Docker Hub repository: username/repository'
+            description: 'Docker Hub repository'
         )
-        string(
-            name: 'RELEASE_VERSION',
-            defaultValue: 'v1.0.0',
-            description: 'Unique image tag for this release'
-        )
+
         string(
             name: 'CONTAINER_NAME',
             defaultValue: 'website-container',
-            description: 'Container name'
+            description: 'Docker container name'
         )
+
         string(
             name: 'HOST_PORT',
             defaultValue: '3000',
-            description: 'Ubuntu host port'
+            description: 'Host port'
         )
+
         string(
             name: 'CONTAINER_PORT',
             defaultValue: '3000',
-            description: 'Application port inside the container'
+            description: 'Container port'
         )
     }
 
     environment {
         DOCKERHUB_REPO = "${params.DOCKERHUB_REPO}"
-        RELEASE_VERSION = "${params.RELEASE_VERSION}"
         CONTAINER_NAME = "${params.CONTAINER_NAME}"
         HOST_PORT = "${params.HOST_PORT}"
         CONTAINER_PORT = "${params.CONTAINER_PORT}"
+
+        // Automatically generate a unique version per Jenkins build.
         IMAGE_TAG = "v${BUILD_NUMBER}"
     }
 
@@ -52,9 +51,14 @@ pipeline {
 
                 sh '''
                     set -eu
-                    echo "Commit: $(git rev-parse --short HEAD)"
                     test -f Dockerfile
                     test -f package.json
+
+                    echo "Git commit:"
+                    git rev-parse --short HEAD
+
+                    echo "Docker image:"
+                    echo "${DOCKERHUB_REPO}:${IMAGE_TAG}"
                 '''
             }
         }
@@ -65,47 +69,22 @@ pipeline {
                     set -eu
 
                     test -n "$DOCKERHUB_REPO"
-                    test -n "$RELEASE_VERSION"
                     test -n "$CONTAINER_NAME"
 
-                    case "$DOCKERHUB_REPO" in
-                        */*) ;;
-                        *) echo "Repository must be username/repository"; exit 1 ;;
-                    esac
+                    echo "$DOCKERHUB_REPO" |
+                        grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$'
 
-                    case "$RELEASE_VERSION" in
-                        *[!a-zA-Z0-9_.-]*|'')
-                            echo "Invalid image tag"
-                            exit 1
-                            ;;
-                    esac
+                    echo "$CONTAINER_NAME" |
+                        grep -Eq '^[a-zA-Z0-9][a-zA-Z0-9_.-]*$'
 
-                    case "$CONTAINER_NAME" in
-                        *[!a-zA-Z0-9_.-]*|'')
-                            echo "Invalid container name"
-                            exit 1
-                            ;;
-                    esac
-
-                    for PORT_VALUE in "$HOST_PORT" "$CONTAINER_PORT"; do
-                        case "$PORT_VALUE" in
-                            *[!0-9]*|'')
-                                echo "Ports must be numeric"
-                                exit 1
-                                ;;
-                        esac
-
-                        [ "$PORT_VALUE" -ge 1 ] &&
-                        [ "$PORT_VALUE" -le 65535 ] || {
-                            echo "Ports must be between 1 and 65535"
-                            exit 1
-                        }
+                    for PORT in "$HOST_PORT" "$CONTAINER_PORT"; do
+                        echo "$PORT" | grep -Eq '^[0-9]+$'
+                        test "$PORT" -ge 1
+                        test "$PORT" -le 65535
                     done
 
-                    echo "Repository: $DOCKERHUB_REPO"
-                    echo "Version: $RELEASE_VERSION"
-                    echo "Container: $CONTAINER_NAME"
-                    echo "Port mapping: $HOST_PORT:$CONTAINER_PORT"
+                    echo "Image tag: $IMAGE_TAG"
+                    echo "Parameters validated successfully."
                 '''
             }
         }
@@ -114,9 +93,9 @@ pipeline {
             steps {
                 sh '''
                     set -eu
-                    IMAGE="${DOCKERHUB_REPO}:${RELEASE_VERSION}"
 
-                    docker build --pull --tag "$IMAGE" .
+                    docker build --pull \
+                        --tag "${DOCKERHUB_REPO}:${IMAGE_TAG}" .
                 '''
             }
         }
@@ -125,16 +104,16 @@ pipeline {
             steps {
                 sh '''
                     set -eu
-                    docker image inspect \
-                        "${DOCKERHUB_REPO}:${RELEASE_VERSION}" \
-                        >/dev/null
 
-                    echo "Docker image verified."
+                    docker image inspect \
+                        "${DOCKERHUB_REPO}:${IMAGE_TAG}" >/dev/null
+
+                    echo "Image verified successfully."
                 '''
             }
         }
 
-        stage('Push Image') {
+        stage('Push Image to Docker Hub') {
             steps {
                 withCredentials([
                     usernamePassword(
@@ -152,8 +131,7 @@ pipeline {
                                 --username "$REGISTRY_USER" \
                                 --password-stdin
 
-                        docker push \
-                            "${DOCKERHUB_REPO}:${RELEASE_VERSION}"
+                        docker push "${DOCKERHUB_REPO}:${IMAGE_TAG}"
 
                         docker logout
                     '''
@@ -179,8 +157,7 @@ pipeline {
                                 --username "$REGISTRY_USER" \
                                 --password-stdin
 
-                        docker pull \
-                            "${DOCKERHUB_REPO}:${RELEASE_VERSION}"
+                        docker pull "${DOCKERHUB_REPO}:${IMAGE_TAG}"
 
                         docker logout
                     '''
@@ -193,89 +170,72 @@ pipeline {
                 sh '''
                     set -eu
 
-                    IMAGE="${DOCKERHUB_REPO}:${RELEASE_VERSION}"
+                    IMAGE="${DOCKERHUB_REPO}:${IMAGE_TAG}"
                     NAME="$CONTAINER_NAME"
                     PORT="$HOST_PORT"
                     TARGET_PORT="$CONTAINER_PORT"
 
-                    docker image inspect "$IMAGE" >/dev/null
-
-                    # Record the previous container image for rollback.
+                    # Capture the existing image before replacing the container.
                     OLD_IMAGE=$(docker inspect \
-                        --format '{{.Config.Image}}' "$NAME" \
-                        2>/dev/null || true)
+                        --format '{{.Config.Image}}' "$NAME" 2>/dev/null || true)
 
-                    # Remove the previous container, as in the manual steps.
+                    echo "Deploying: $IMAGE"
+
+                    # Replace the existing application container.
                     docker rm -f "$NAME" 2>/dev/null || true
 
-                    # Start the newly published image.
-                    if ! docker run -d \
+                    docker run -d \
                         --name "$NAME" \
                         --restart unless-stopped \
                         -p "${PORT}:${TARGET_PORT}" \
-                        "$IMAGE"; then
+                        "$IMAGE"
 
-                        echo "New container failed to start."
-
-                        if [ -n "$OLD_IMAGE" ]; then
-                            docker run -d \
-                                --name "$NAME" \
-                                --restart unless-stopped \
-                                -p "${PORT}:${TARGET_PORT}" \
-                                "$OLD_IMAGE"
-                            echo "Previous image restarted."
-                        fi
-
-                        exit 1
-                    fi
-
-                    # Wait for startup and check both container state and HTTP.
                     HEALTHY=false
 
+                    # Wait for the application to respond over HTTP.
                     for ATTEMPT in $(seq 1 30); do
-                        if ! docker inspect \
+                        RUNNING=$(docker inspect \
                             --format '{{.State.Running}}' "$NAME" \
-                            2>/dev/null | grep -qx true; then
+                            2>/dev/null || true)
 
-                            echo "Container stopped during startup."
+                        if [ "$RUNNING" != "true" ]; then
+                            echo "New container stopped unexpectedly."
                             break
                         fi
 
                         if curl --fail --silent \
                             --max-time 3 \
                             "http://127.0.0.1:${PORT}/" >/dev/null; then
-
                             HEALTHY=true
                             break
                         fi
 
-                        echo "Waiting for HTTP response: attempt ${ATTEMPT}/30"
+                        echo "Waiting for application health check: $ATTEMPT/30"
                         sleep 2
                     done
 
                     if [ "$HEALTHY" != "true" ]; then
                         echo "Deployment health check failed."
                         docker logs "$NAME" || true
+
                         docker rm -f "$NAME" 2>/dev/null || true
 
+                        # Best-effort rollback to the previously running image.
                         if [ -n "$OLD_IMAGE" ]; then
-                            echo "Rolling back to $OLD_IMAGE"
+                            echo "Rolling back to: $OLD_IMAGE"
 
                             docker run -d \
                                 --name "$NAME" \
                                 --restart unless-stopped \
                                 -p "${PORT}:${TARGET_PORT}" \
-                                "$OLD_IMAGE"
-
-                            echo "Previous image restarted."
-                        else
-                            echo "No previous image is available for rollback."
+                                "$OLD_IMAGE" || true
                         fi
 
                         exit 1
                     fi
 
-                    echo "Deployment and HTTP verification succeeded."
+                    echo "Deployment and HTTP health check succeeded."
+
                     docker ps --filter "name=^/${NAME}$"
                 '''
             }
@@ -284,15 +244,15 @@ pipeline {
 
     post {
         success {
-            echo 'SUCCESS: Build, push, pull, deployment and HTTP check completed.'
+            echo "Deployment successful. Image: ${DOCKERHUB_REPO}:${IMAGE_TAG}"
         }
 
         failure {
-            echo 'FAILURE: Review the first failed stage and its logs.'
+            echo "Pipeline failed. Check the failed stage and console logs."
         }
 
         always {
-            echo 'Pipeline execution finished.'
+            echo "Jenkins build #${BUILD_NUMBER} completed."
         }
     }
 }
